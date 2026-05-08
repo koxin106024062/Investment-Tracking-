@@ -25,7 +25,9 @@
 <div id="root"></div>
 <script type="text/babel">
 const { useState, useEffect, useMemo } = React;
+
 const STORAGE_KEY = 'stock_tracker_v2';
+
 // 初始資料：MU 美光
 const INITIAL_STOCKS = {
   'MU': {
@@ -50,6 +52,7 @@ const INITIAL_STOCKS = {
     ],
   },
 };
+
 function getNextTxId(transactions) {
   const maxId = transactions.reduce((max, tx) => {
     const numericId = parseInt(tx.id, 10);
@@ -57,9 +60,11 @@ function getNextTxId(transactions) {
   }, 0);
   return (maxId + 1).toString();
 }
+
 function normalizeStoredData(data) {
   const sourceStocks = data.stocks || INITIAL_STOCKS;
   const stocks = { ...sourceStocks };
+
   if (stocks.MU && Array.isArray(stocks.MU.transactions)) {
     const transactions = stocks.MU.transactions.map(tx => {
       if (/^2025-(02|03|04|05)-/.test(tx.date)) {
@@ -67,12 +72,14 @@ function normalizeStoredData(data) {
       }
       return tx;
     });
+
     const hasDividend = transactions.some(tx =>
       tx.type === 'dividend' &&
       tx.date === '2026-04-16' &&
       Number(tx.shares) === 23 &&
       Math.abs(Number(tx.twd)) === 76
     );
+
     if (!hasDividend) {
       transactions.push({
         id: getNextTxId(transactions),
@@ -83,9 +90,1197 @@ function normalizeStoredData(data) {
         twd: 76,
       });
     }
+
     stocks.MU = {
       ...stocks.MU,
       transactions,
     };
   }
+
   return {
+    stocks,
+    exchangeRate: data.exchangeRate || 31.5,
+  };
+}
+
+// FIFO 計算（成本與損益都用台幣）
+function calcFIFO(transactions) {
+  const sorted = [...transactions].sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    return parseInt(a.id) - parseInt(b.id);
+  });
+
+  const lots = [];
+  let realizedPL = 0;
+  const realizedDetails = [];
+
+  for (const tx of sorted) {
+    if (tx.type === 'buy') {
+      const twdCost = Math.abs(tx.twd);
+      lots.push({
+        shares: tx.shares,
+        originalShares: tx.shares,
+        twdCostPerShare: twdCost / tx.shares,
+        usdPrice: tx.price,
+        date: tx.date,
+        txId: tx.id,
+      });
+    } else if (tx.type === 'sell') {
+      let toSell = tx.shares;
+      const proceedTWD = tx.twd;
+      let costBasisTWD = 0;
+
+      while (toSell > 0 && lots.length > 0) {
+        const lot = lots[0];
+        if (lot.shares <= toSell) {
+          costBasisTWD += lot.shares * lot.twdCostPerShare;
+          toSell -= lot.shares;
+          lots.shift();
+        } else {
+          costBasisTWD += toSell * lot.twdCostPerShare;
+          lot.shares -= toSell;
+          toSell = 0;
+        }
+      }
+
+      const pl = proceedTWD - costBasisTWD;
+      realizedPL += pl;
+      realizedDetails.push({
+        type: 'sell',
+        date: tx.date,
+        shares: tx.shares,
+        usdPrice: tx.price,
+        proceedTWD,
+        costBasisTWD,
+        pl,
+      });
+    } else if (tx.type === 'dividend') {
+      const incomeTWD = Math.abs(tx.twd);
+      realizedPL += incomeTWD;
+      realizedDetails.push({
+        type: 'dividend',
+        date: tx.date,
+        shares: tx.shares,
+        usdPrice: tx.price || 0,
+        proceedTWD: incomeTWD,
+        costBasisTWD: 0,
+        pl: incomeTWD,
+      });
+    }
+  }
+
+  const remainingShares = lots.reduce((s, l) => s + l.shares, 0);
+  const remainingCostTWD = lots.reduce((s, l) => s + l.shares * l.twdCostPerShare, 0);
+  const avgTWDPerShare = remainingShares > 0 ? remainingCostTWD / remainingShares : 0;
+
+  return {
+    lots,
+    remainingShares,
+    remainingCostTWD,
+    avgTWDPerShare,
+    realizedPL,
+    realizedDetails,
+  };
+}
+
+const fmtTWD = (n) => Math.round(n).toLocaleString('en-US');
+const fmtUSD = (n, d = 2) => '$' + n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const formatDate = (s) => s.slice(5).replace('-', '/');
+
+function App() {
+  const [stocks, setStocks] = useState({});
+  const [exchangeRate, setExchangeRate] = useState(31.5);
+  const [view, setView] = useState({ page: 'home' });
+  const [showAddTx, setShowAddTx] = useState(false);
+  const [showAddStock, setShowAddStock] = useState(false);
+  const [showBackup, setShowBackup] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      const data = saved ? JSON.parse(saved) : { stocks: INITIAL_STOCKS, exchangeRate: 31.5 };
+      const normalized = normalizeStoredData(data);
+      setStocks(normalized.stocks);
+      setExchangeRate(normalized.exchangeRate);
+    } catch (e) {
+      const normalized = normalizeStoredData({ stocks: INITIAL_STOCKS, exchangeRate: 31.5 });
+      setStocks(normalized.stocks);
+      setExchangeRate(normalized.exchangeRate);
+    }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ stocks, exchangeRate }));
+    } catch (e) {}
+  }, [stocks, exchangeRate, loaded]);
+
+  const stockResults = useMemo(() => {
+    const results = {};
+    Object.keys(stocks).forEach(sym => {
+      const s = stocks[sym];
+      const fifo = calcFIFO(s.transactions);
+      const currentMarketTWD = fifo.remainingShares * (s.currentPrice || 0) * exchangeRate;
+      const unrealizedPL = (s.currentPrice || 0) > 0 ? currentMarketTWD - fifo.remainingCostTWD : null;
+      results[sym] = {
+        ...fifo,
+        symbol: sym,
+        name: s.name,
+        currentPrice: s.currentPrice,
+        currentMarketTWD,
+        unrealizedPL,
+        totalPL: fifo.realizedPL + (unrealizedPL || 0),
+      };
+    });
+    return results;
+  }, [stocks, exchangeRate]);
+
+  const portfolio = useMemo(() => {
+    let totalCost = 0, totalRealized = 0, totalUnrealized = 0, hasAllPrices = true;
+    Object.values(stockResults).forEach(r => {
+      totalCost += r.remainingCostTWD;
+      totalRealized += r.realizedPL;
+      if (r.unrealizedPL === null) hasAllPrices = false;
+      else totalUnrealized += r.unrealizedPL;
+    });
+    return { totalCost, totalRealized, totalUnrealized, hasAllPrices };
+  }, [stockResults]);
+
+  if (!loaded) {
+    return <div className="min-h-screen flex items-center justify-center text-gray-400">載入中...</div>;
+  }
+
+  // === Home 頁面 ===
+  if (view.page === 'home') {
+    return (
+      <div className="min-h-screen pb-28" style={{ background: '#F1F2F4' }}>
+        <div className="px-4 pt-6 pb-2">
+          <div className="flex justify-between items-center mb-1">
+            <h1 className="text-2xl font-bold text-gray-800">投資組合</h1>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowBackup(true)}
+                className="bg-white rounded-full px-3 py-1.5 shadow-sm text-xs font-medium text-morandi-blue-dark active:opacity-60"
+              >
+                備份
+              </button>
+              <div className="flex items-center gap-2 bg-white rounded-full px-3 py-1.5 shadow-sm">
+                <span className="text-xs text-gray-400">USD</span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="any"
+                  value={exchangeRate}
+                  onChange={(e) => setExchangeRate(parseFloat(e.target.value) || 31.5)}
+                  className="w-12 text-sm font-semibold text-gray-700 focus:outline-none"
+                />
+              </div>
+            </div>
+          </div>
+          <div className="text-xs text-gray-400">所有金額以台幣計算</div>
+        </div>
+
+        <div className="px-4 mt-3">
+          <div className="rounded-3xl p-6 text-white shadow-lg" style={{ background: 'linear-gradient(135deg, #8E9AAF 0%, #6B7A99 100%)' }}>
+            <div className="text-white/70 text-xs mb-1">總投入成本</div>
+            <div className="text-3xl font-bold mb-4">
+              NT$ {fmtTWD(portfolio.totalCost)}
+            </div>
+
+            <div className="border-t border-white/20 pt-4 grid grid-cols-2 gap-3">
+              <div className="bg-white/10 rounded-xl p-3 backdrop-blur">
+                <div className="text-white/70 text-xs mb-1">已實現損益</div>
+                <div className="text-lg font-bold">
+                  {portfolio.totalRealized >= 0 ? '+' : ''}{fmtTWD(portfolio.totalRealized)}
+                </div>
+              </div>
+              <div className="bg-white/10 rounded-xl p-3 backdrop-blur">
+                <div className="text-white/70 text-xs mb-1">未實現損益</div>
+                <div className="text-lg font-bold">
+                  {portfolio.hasAllPrices ? (
+                    (portfolio.totalUnrealized >= 0 ? '+' : '') + fmtTWD(portfolio.totalUnrealized)
+                  ) : (
+                    <span className="text-white/50 text-sm">部分需股價</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="px-4 mt-4">
+          <div className="flex justify-between items-center mb-2 px-1">
+            <h2 className="text-sm font-semibold text-gray-600">持有股票</h2>
+            <button
+              onClick={() => setShowAddStock(true)}
+              className="text-xs font-medium text-morandi-blue-dark active:opacity-60"
+            >
+              + 新增股票
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {Object.values(stockResults).length === 0 ? (
+              <div className="bg-white rounded-2xl p-10 text-center text-gray-400 text-sm">
+                尚無股票，點上方「+ 新增股票」開始
+              </div>
+            ) : (
+              Object.values(stockResults)
+                .sort((a, b) => b.remainingShares - a.remainingShares)
+                .map(r => (
+                  <button
+                    key={r.symbol}
+                    onClick={() => setView({ page: 'detail', symbol: r.symbol })}
+                    className="w-full bg-white rounded-2xl p-4 shadow-sm active:scale-98 transition-transform text-left"
+                  >
+                    <div className="flex justify-between items-start mb-2">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-gray-800 text-lg">{r.symbol}</span>
+                          {r.remainingShares === 0 && (
+                            <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-500 rounded-full">已清倉</span>
+                          )}
+                        </div>
+                        <div className="text-xs text-gray-500">{r.name}</div>
+                      </div>
+                      <div className="text-right">
+                        {r.remainingShares > 0 ? (
+                          <>
+                            <div className="text-base font-bold text-gray-800">{r.remainingShares} 股</div>
+                            <div className="text-xs text-gray-500">均價 {fmtTWD(r.avgTWDPerShare)} TWD</div>
+                          </>
+                        ) : (
+                          <div className="text-sm text-gray-400">—</div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="pt-2 border-t border-gray-100 grid grid-cols-2 gap-2 text-xs">
+                      <div>
+                        <div className="text-gray-400 mb-0.5">已實現</div>
+                        <div className={`font-semibold ${r.realizedPL >= 0 ? 'text-morandi-green' : 'text-morandi-red'}`}>
+                          {r.realizedPL >= 0 ? '+' : ''}{fmtTWD(r.realizedPL)}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-gray-400 mb-0.5">未實現</div>
+                        {r.unrealizedPL !== null ? (
+                          <div className={`font-semibold ${r.unrealizedPL >= 0 ? 'text-morandi-green' : 'text-morandi-red'}`}>
+                            {r.unrealizedPL >= 0 ? '+' : ''}{fmtTWD(r.unrealizedPL)}
+                          </div>
+                        ) : (
+                          <div className="text-gray-400">需股價</div>
+                        )}
+                      </div>
+                    </div>
+                  </button>
+                ))
+            )}
+          </div>
+        </div>
+
+        <button
+          onClick={() => setShowAddTx(true)}
+          className="fixed bottom-6 right-6 w-16 h-16 rounded-full text-white shadow-2xl flex items-center justify-center text-3xl active:scale-95 transition-transform z-40"
+          style={{ background: '#8E9AAF' }}
+        >
+          +
+        </button>
+
+        {showAddTx && (
+          <AddTxModal
+            stocks={stocks}
+            onClose={() => setShowAddTx(false)}
+            onAdd={(sym, tx) => {
+              setStocks({
+                ...stocks,
+                [sym]: {
+                  ...stocks[sym],
+                  transactions: [...stocks[sym].transactions, { ...tx, id: Date.now().toString() }],
+                },
+              });
+              setShowAddTx(false);
+            }}
+            onAddStock={() => {
+              setShowAddTx(false);
+              setShowAddStock(true);
+            }}
+          />
+        )}
+
+        {showAddStock && (
+          <AddStockModal
+            existingSymbols={Object.keys(stocks)}
+            onClose={() => setShowAddStock(false)}
+            onAdd={(sym, name) => {
+              setStocks({
+                ...stocks,
+                [sym]: { symbol: sym, name, currentPrice: 0, transactions: [] },
+              });
+              setShowAddStock(false);
+            }}
+          />
+        )}
+
+        {showBackup && (
+          <BackupModal
+            data={{ stocks, exchangeRate }}
+            onClose={() => setShowBackup(false)}
+            onImport={(imported) => {
+              if (imported.stocks) setStocks(imported.stocks);
+              if (imported.exchangeRate) setExchangeRate(imported.exchangeRate);
+              setShowBackup(false);
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+
+  // === Detail 頁面 ===
+  if (view.page === 'detail') {
+    const stock = stocks[view.symbol];
+    const result = stockResults[view.symbol];
+    if (!stock) {
+      setView({ page: 'home' });
+      return null;
+    }
+
+    return (
+      <DetailPage
+        stock={stock}
+        result={result}
+        exchangeRate={exchangeRate}
+        onBack={() => setView({ page: 'home' })}
+        onUpdatePrice={(price) => {
+          setStocks({
+            ...stocks,
+            [view.symbol]: { ...stock, currentPrice: price },
+          });
+        }}
+        onUpdateName={(name) => {
+          setStocks({
+            ...stocks,
+            [view.symbol]: { ...stock, name },
+          });
+        }}
+        onAddTx={(tx) => {
+          setStocks({
+            ...stocks,
+            [view.symbol]: {
+              ...stock,
+              transactions: [...stock.transactions, { ...tx, id: Date.now().toString() }],
+            },
+          });
+        }}
+        onUpdateTx={(id, txData) => {
+          setStocks({
+            ...stocks,
+            [view.symbol]: {
+              ...stock,
+              transactions: stock.transactions.map(t =>
+                t.id === id ? { ...t, ...txData } : t
+              ),
+            },
+          });
+        }}
+        onDeleteTx={(id) => {
+          setStocks({
+            ...stocks,
+            [view.symbol]: {
+              ...stock,
+              transactions: stock.transactions.filter(t => t.id !== id),
+            },
+          });
+        }}
+        onDeleteStock={() => {
+          if (confirm(`確定刪除 ${stock.symbol}（${stock.name}）的所有資料？`)) {
+            const newStocks = { ...stocks };
+            delete newStocks[view.symbol];
+            setStocks(newStocks);
+            setView({ page: 'home' });
+          }
+        }}
+      />
+    );
+  }
+}
+
+function DetailPage({ stock, result, exchangeRate, onBack, onUpdatePrice, onUpdateName, onAddTx, onUpdateTx, onDeleteTx, onDeleteStock }) {
+  const [activeTab, setActiveTab] = useState('summary');
+  const [showAddTx, setShowAddTx] = useState(false);
+  const [editingTx, setEditingTx] = useState(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameInput, setNameInput] = useState(stock.name);
+
+  const currentMarketTWD = result.currentMarketTWD;
+  const unrealizedPL = result.unrealizedPL;
+  const totalPL = result.realizedPL + (unrealizedPL || 0);
+
+  const sortedTx = useMemo(() => {
+    return [...stock.transactions].sort((a, b) => {
+      if (a.date !== b.date) return b.date.localeCompare(a.date);
+      return parseInt(b.id) - parseInt(a.id);
+    });
+  }, [stock.transactions]);
+
+  return (
+    <div className="min-h-screen pb-28" style={{ background: '#F1F2F4' }}>
+      <div className="px-4 pt-5 pb-2 flex items-center justify-between">
+        <button onClick={onBack} className="text-morandi-blue-dark font-medium text-sm active:opacity-60">
+          ← 返回
+        </button>
+        <button onClick={onDeleteStock} className="text-gray-400 text-xs active:text-morandi-red">
+          刪除股票
+        </button>
+      </div>
+
+      <div className="px-4 mt-2">
+        <div className="rounded-3xl p-6 text-white shadow-lg" style={{ background: 'linear-gradient(135deg, #8E9AAF 0%, #6B7A99 100%)' }}>
+          <div className="flex justify-between items-start mb-4">
+            <div className="flex-1">
+              {editingName ? (
+                <div className="mb-1">
+                  <input
+                    type="text"
+                    value={nameInput}
+                    onChange={(e) => setNameInput(e.target.value)}
+                    onBlur={() => {
+                      onUpdateName(nameInput.trim() || stock.symbol);
+                      setEditingName(false);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        onUpdateName(nameInput.trim() || stock.symbol);
+                        setEditingName(false);
+                      }
+                    }}
+                    autoFocus
+                    className="bg-white/20 text-white text-xs px-2 py-1 rounded focus:outline-none w-full"
+                  />
+                </div>
+              ) : (
+                <button
+                  onClick={() => { setNameInput(stock.name); setEditingName(true); }}
+                  className="text-white/70 text-xs mb-1 active:opacity-60"
+                >
+                  {stock.name} ✎
+                </button>
+              )}
+              <div className="text-3xl font-bold">{stock.symbol}</div>
+            </div>
+            <div className="text-right">
+              <div className="text-white/70 text-xs mb-1">剩餘股數</div>
+              <div className="text-3xl font-bold">{result.remainingShares}</div>
+            </div>
+          </div>
+
+          <div className="border-t border-white/20 pt-4">
+            <div className="text-white/70 text-xs mb-1">總損益</div>
+            <div className="text-3xl font-bold mb-3">
+              {totalPL >= 0 ? '+' : ''}NT$ {fmtTWD(totalPL)}
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="bg-white/10 rounded-xl p-3 backdrop-blur">
+                <div className="text-white/70 text-xs mb-1">已實現</div>
+                <div className="text-base font-semibold">
+                  {result.realizedPL >= 0 ? '+' : ''}{fmtTWD(result.realizedPL)}
+                </div>
+              </div>
+              <div className="bg-white/10 rounded-xl p-3 backdrop-blur">
+                <div className="text-white/70 text-xs mb-1">未實現</div>
+                <div className="text-base font-semibold">
+                  {unrealizedPL !== null ? (
+                    (unrealizedPL >= 0 ? '+' : '') + fmtTWD(unrealizedPL)
+                  ) : (
+                    <span className="text-white/50 text-sm">需股價</span>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 mt-3">
+        <div className="bg-white rounded-2xl p-4 shadow-sm">
+          <div className="grid grid-cols-2 gap-4 mb-3">
+            <div>
+              <div className="text-xs text-gray-500 mb-1">每股成本（TWD）</div>
+              <div className="text-lg font-bold text-morandi-blue-dark">
+                {result.remainingShares > 0 ? fmtTWD(result.avgTWDPerShare) : '—'}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">投入成本（TWD）</div>
+              <div className="text-lg font-bold text-morandi-blue-dark">
+                {fmtTWD(result.remainingCostTWD)}
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-100 pt-3">
+            <label className="text-xs text-gray-500 mb-1 block">目前股價（USD）</label>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="any"
+              value={stock.currentPrice || ''}
+              onChange={(e) => onUpdatePrice(parseFloat(e.target.value) || 0)}
+              placeholder="輸入即時股價"
+              className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-base focus:outline-none focus:border-morandi-blue"
+              style={{ borderColor: stock.currentPrice ? '#8E9AAF' : undefined }}
+            />
+            {stock.currentPrice > 0 && result.remainingShares > 0 && (
+              <div className="mt-3 pt-3 border-t border-gray-100 space-y-1.5 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-500">目前市值</span>
+                  <span className="font-semibold text-gray-800">
+                    NT$ {fmtTWD(currentMarketTWD)}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">換算每股</span>
+                  <span className="text-gray-700">
+                    NT$ {fmtTWD(stock.currentPrice * exchangeRate)} / 股
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 mt-4">
+        <div className="bg-white rounded-xl p-1 flex shadow-sm">
+          {[
+            { key: 'summary', label: '已實現損益' },
+            { key: 'lots', label: '剩餘批次' },
+            { key: 'history', label: '交易紀錄' },
+          ].map(t => (
+            <button
+              key={t.key}
+              onClick={() => setActiveTab(t.key)}
+              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === t.key ? 'text-white shadow-sm' : 'text-gray-500'
+              }`}
+              style={{ background: activeTab === t.key ? '#8E9AAF' : 'transparent' }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="px-4 mt-3">
+        {activeTab === 'summary' && (
+          <div className="space-y-2">
+            {result.realizedDetails.length === 0 ? (
+              <div className="bg-white rounded-2xl p-8 text-center text-gray-400 text-sm">
+                尚無已實現損益
+              </div>
+            ) : (
+              <>
+                {result.realizedDetails.slice().reverse().map((d, i) => (
+                  <div key={i} className="bg-white rounded-2xl p-4 shadow-sm">
+                    <div className="flex justify-between items-start mb-2">
+                      <div>
+                        <div className="text-sm font-semibold text-gray-700">
+                          {formatDate(d.date)} {d.type === 'dividend' ? '股息' : '賣出'} {d.shares} 股
+                        </div>
+                        <div className="text-xs text-gray-400 mt-0.5">
+                          {d.type === 'dividend' ? '每股股息 ' : '@ '}{fmtUSD(d.usdPrice)}
+                        </div>
+                      </div>
+                      <div className={`text-base font-bold ${d.pl >= 0 ? 'text-morandi-green' : 'text-morandi-red'}`}>
+                        {d.pl >= 0 ? '+' : ''}{fmtTWD(d.pl)}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-100 text-xs">
+                      <div>
+                        <span className="text-gray-400">收入 </span>
+                        <span className="text-gray-700">{fmtTWD(d.proceedTWD)}</span>
+                      </div>
+                      {d.type === 'dividend' ? (
+                        <div>
+                          <span className="text-gray-400">類型 </span>
+                          <span className="text-gray-700">股息</span>
+                        </div>
+                      ) : (
+                        <div>
+                          <span className="text-gray-400">成本 </span>
+                          <span className="text-gray-700">{fmtTWD(d.costBasisTWD)}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                <div className="rounded-2xl p-4 text-white" style={{ background: '#6B7A99' }}>
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm">已實現損益合計</span>
+                    <span className="text-xl font-bold">
+                      {result.realizedPL >= 0 ? '+' : ''}{fmtTWD(result.realizedPL)}
+                    </span>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'lots' && (
+          <div className="space-y-2">
+            <div className="bg-white rounded-2xl p-3 text-xs text-gray-500">
+              目前 {result.remainingShares} 股的成本來源（FIFO 順序）
+            </div>
+            {result.lots.length === 0 ? (
+              <div className="bg-white rounded-2xl p-8 text-center text-gray-400 text-sm">
+                目前無持股
+              </div>
+            ) : (
+              result.lots.map((lot, i) => (
+                <div key={i} className="bg-white rounded-2xl p-4 shadow-sm">
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <div className="text-sm font-semibold text-gray-700">
+                        {formatDate(lot.date)}
+                      </div>
+                      <div className="text-xs text-gray-400 mt-0.5">
+                        買入 @ {fmtUSD(lot.usdPrice)}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-base font-bold text-morandi-blue-dark">
+                        {lot.shares} 股
+                        {lot.shares < lot.originalShares && (
+                          <span className="text-xs text-gray-400 ml-1">/ {lot.originalShares}</span>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-500 mt-0.5">
+                        {fmtTWD(lot.twdCostPerShare)} / 股
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-2 pt-2 border-t border-gray-100 flex justify-between text-xs">
+                    <span className="text-gray-400">此批次成本</span>
+                    <span className="font-medium text-gray-700">
+                      NT$ {fmtTWD(lot.shares * lot.twdCostPerShare)}
+                    </span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {activeTab === 'history' && (
+          <div className="space-y-2">
+            {sortedTx.length === 0 ? (
+              <div className="bg-white rounded-2xl p-8 text-center text-gray-400 text-sm">
+                尚無交易紀錄
+              </div>
+            ) : (
+              sortedTx.map(tx => (
+                <TxCard
+                  key={tx.id}
+                  tx={tx}
+                  onEdit={() => setEditingTx(tx)}
+                  onDelete={() => {
+                    if (confirm('確定刪除這筆交易？')) onDeleteTx(tx.id);
+                  }}
+                />
+              ))
+            )}
+          </div>
+        )}
+      </div>
+
+      <button
+        onClick={() => setShowAddTx(true)}
+        className="fixed bottom-6 right-6 w-16 h-16 rounded-full text-white shadow-2xl flex items-center justify-center text-3xl active:scale-95 transition-transform z-40"
+        style={{ background: '#8E9AAF' }}
+      >
+        +
+      </button>
+
+      {showAddTx && (
+        <AddTxModal
+          stocks={{ [stock.symbol]: stock }}
+          fixedSymbol={stock.symbol}
+          onClose={() => setShowAddTx(false)}
+          onAdd={(sym, tx) => {
+            onAddTx(tx);
+            setShowAddTx(false);
+          }}
+        />
+      )}
+
+      {editingTx && (
+        <AddTxModal
+          stocks={{ [stock.symbol]: stock }}
+          fixedSymbol={stock.symbol}
+          editingTx={editingTx}
+          onClose={() => setEditingTx(null)}
+          onUpdate={(id, tx) => {
+            onUpdateTx(id, tx);
+            setEditingTx(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function TxCard({ tx, onDelete, onEdit }) {
+  const isBuy = tx.type === 'buy';
+  const isDividend = tx.type === 'dividend';
+  return (
+    <button
+      onClick={onEdit}
+      className="w-full bg-white rounded-2xl p-4 shadow-sm text-left active:scale-98 transition-transform"
+    >
+      <div className="flex justify-between items-start">
+        <div className="flex items-center gap-3">
+          <div
+            className="px-3 py-1 rounded-full text-xs font-semibold"
+            style={{
+              background: isBuy ? '#D4E2D0' : isDividend ? '#F0E3C0' : '#8E9AAF',
+              color: isBuy ? '#5A7752' : isDividend ? '#8A6D2F' : '#FFFFFF',
+            }}
+          >
+            {isBuy ? '買進' : isDividend ? '股息' : '賣出'}
+          </div>
+          <div>
+            <div className="text-sm font-semibold text-gray-800">
+              {formatDate(tx.date)}
+            </div>
+            <div className="text-xs text-gray-400">
+              {tx.shares} 股 {isDividend ? '每股股息 ' : '@ '}{fmtUSD(tx.price)}
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-300">編輯</span>
+          <span
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            className="text-gray-300 active:text-morandi-red text-xs px-2 py-1"
+          >
+            刪除
+          </span>
+        </div>
+      </div>
+      <div className="mt-3 pt-3 border-t border-gray-100 flex justify-between text-sm">
+        <span className="text-gray-500">交割款（TWD）</span>
+        <span className={`font-semibold ${isBuy ? 'text-gray-700' : isDividend ? 'text-morandi-green' : 'text-morandi-blue-dark'}`}>
+          {tx.twd >= 0 ? '+' : ''}{tx.twd.toLocaleString('en-US')}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function AddTxModal({ stocks, fixedSymbol, editingTx, onClose, onAdd, onUpdate, onAddStock }) {
+  const symbols = Object.keys(stocks);
+  const isEditing = !!editingTx;
+
+  const [form, setForm] = useState(() => {
+    if (editingTx) {
+      return {
+        symbol: fixedSymbol || symbols[0] || '',
+        date: editingTx.date,
+        type: editingTx.type,
+        shares: editingTx.shares.toString(),
+        price: editingTx.price.toString(),
+        twd: Math.abs(editingTx.twd).toString(),
+      };
+    }
+    return {
+      symbol: fixedSymbol || symbols[0] || '',
+      date: new Date().toISOString().split('T')[0],
+      type: 'buy',
+      shares: '',
+      price: '',
+      twd: '',
+    };
+  });
+
+  const handleSubmit = () => {
+    if (!form.symbol) {
+      alert('請選擇或新增股票');
+      return;
+    }
+    if (!form.shares || !form.twd || (form.type !== 'dividend' && !form.price)) {
+      alert('請填寫完整資料');
+      return;
+    }
+    const shares = parseFloat(form.shares);
+    const price = parseFloat(form.price) || 0;
+    let twd = parseFloat(form.twd);
+    if (form.type === 'buy' && twd > 0) twd = -twd;
+    if (form.type === 'sell' && twd < 0) twd = -twd;
+    if (form.type === 'dividend' && twd < 0) twd = -twd;
+
+    const txData = { date: form.date, type: form.type, shares, price, twd };
+
+    if (isEditing) {
+      onUpdate(editingTx.id, txData);
+    } else {
+      onAdd(form.symbol, txData);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl p-5 max-h-[92vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-center mb-5">
+          <h2 className="text-lg font-bold text-gray-800">
+            {isEditing ? '編輯交易' : '新增交易'}
+          </h2>
+          <button onClick={onClose} className="text-gray-400 text-2xl leading-none">×</button>
+        </div>
+
+        <div className="space-y-4">
+          {!fixedSymbol && !isEditing && (
+            <div>
+              <label className="text-xs text-gray-500 mb-1.5 block">股票</label>
+              {symbols.length > 0 ? (
+                <div className="flex gap-2">
+                  <select
+                    value={form.symbol}
+                    onChange={(e) => setForm({ ...form, symbol: e.target.value })}
+                    className="flex-1 px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none bg-white"
+                  >
+                    {symbols.map(s => (
+                      <option key={s} value={s}>{s} - {stocks[s].name}</option>
+                    ))}
+                  </select>
+                  {onAddStock && (
+                    <button
+                      onClick={onAddStock}
+                      className="px-4 rounded-xl text-sm font-medium text-morandi-blue-dark border border-gray-200 active:opacity-60"
+                    >
+                      + 新股票
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <button
+                  onClick={onAddStock}
+                  className="w-full py-3 rounded-xl text-sm font-medium text-white"
+                  style={{ background: '#8E9AAF' }}
+                >
+                  先新增一支股票
+                </button>
+              )}
+            </div>
+          )}
+
+          {(fixedSymbol || isEditing) && (
+            <div className="bg-gray-50 rounded-xl p-3 text-sm text-gray-600">
+              <span className="text-xs text-gray-400">股票：</span>
+              <span className="font-semibold text-gray-800">{fixedSymbol || form.symbol}</span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              onClick={() => setForm({ ...form, type: 'buy' })}
+              className="py-3 rounded-xl font-semibold text-sm transition-all active:scale-95"
+              style={{
+                background: form.type === 'buy' ? '#A8C4A2' : '#F1F2F4',
+                color: form.type === 'buy' ? '#FFFFFF' : '#9CA3AF',
+              }}
+            >
+              買進
+            </button>
+            <button
+              onClick={() => setForm({ ...form, type: 'sell' })}
+              className="py-3 rounded-xl font-semibold text-sm transition-all active:scale-95"
+              style={{
+                background: form.type === 'sell' ? '#6B7A99' : '#F1F2F4',
+                color: form.type === 'sell' ? '#FFFFFF' : '#9CA3AF',
+              }}
+            >
+              賣出
+            </button>
+            <button
+              onClick={() => setForm({ ...form, type: 'dividend' })}
+              className="py-3 rounded-xl font-semibold text-sm transition-all active:scale-95"
+              style={{
+                background: form.type === 'dividend' ? '#F0E3C0' : '#F1F2F4',
+                color: form.type === 'dividend' ? '#8A6D2F' : '#9CA3AF',
+              }}
+            >
+              股息
+            </button>
+          </div>
+
+          <div>
+            <label className="text-xs text-gray-500 mb-1.5 block">交易日期</label>
+            <input
+              type="date"
+              value={form.date}
+              onChange={(e) => setForm({ ...form, date: e.target.value })}
+              className="w-full px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-gray-500 mb-1.5 block">股數</label>
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                value={form.shares}
+                onChange={(e) => setForm({ ...form, shares: e.target.value })}
+                placeholder="10"
+                className="w-full px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 mb-1.5 block">
+                {form.type === 'dividend' ? '每股股息（USD）' : '單價（USD）'}
+              </label>
+              <input
+                type="number"
+                inputMode="decimal"
+                step="any"
+                value={form.price}
+                onChange={(e) => setForm({ ...form, price: e.target.value })}
+                placeholder="478.97"
+                className="w-full px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="text-xs text-gray-500 mb-1.5 block">
+              交割款 TWD（{form.type === 'buy' ? '輸入正數即可，會自動轉負' : '正數'}）
+            </label>
+            <input
+              type="number"
+              inputMode="decimal"
+              step="any"
+              value={form.twd}
+              onChange={(e) => setForm({ ...form, twd: e.target.value })}
+              placeholder={form.type === 'buy' ? '127203' : '136487'}
+              className="w-full px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none"
+            />
+          </div>
+
+          <button
+            onClick={handleSubmit}
+            className="w-full py-4 rounded-xl text-white font-semibold text-base mt-2 active:scale-98 transition-transform shadow-md"
+            style={{ background: '#8E9AAF' }}
+          >
+            {isEditing ? '儲存變更' : '確認新增'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddStockModal({ existingSymbols, onClose, onAdd }) {
+  const [symbol, setSymbol] = useState('');
+  const [name, setName] = useState('');
+
+  const handleSubmit = () => {
+    const sym = symbol.trim().toUpperCase();
+    if (!sym) {
+      alert('請輸入股票代號');
+      return;
+    }
+    if (existingSymbols.includes(sym)) {
+      alert('此股票已存在');
+      return;
+    }
+    onAdd(sym, name.trim() || sym);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl p-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-center mb-5">
+          <h2 className="text-lg font-bold text-gray-800">新增股票</h2>
+          <button onClick={onClose} className="text-gray-400 text-2xl leading-none">×</button>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="text-xs text-gray-500 mb-1.5 block">股票代號</label>
+            <input
+              type="text"
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+              placeholder="例如：AAPL、NVDA、TSLA"
+              className="w-full px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none uppercase font-semibold"
+            />
+          </div>
+
+          <div>
+            <label className="text-xs text-gray-500 mb-1.5 block">公司名稱（選填）</label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如：蘋果、輝達"
+              className="w-full px-4 py-3 border border-gray-200 rounded-xl text-base focus:outline-none"
+            />
+          </div>
+
+          <button
+            onClick={handleSubmit}
+            className="w-full py-4 rounded-xl text-white font-semibold text-base mt-2 active:scale-98 transition-transform shadow-md"
+            style={{ background: '#8E9AAF' }}
+          >
+            新增股票
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackupModal({ data, onClose, onImport }) {
+  const [mode, setMode] = useState('export');
+  const [importText, setImportText] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  const exportJSON = JSON.stringify(data, null, 2);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(exportJSON);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      alert('複製失敗，請手動長按選取');
+    }
+  };
+
+  const handleDownload = () => {
+    const blob = new Blob([exportJSON], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const today = new Date().toISOString().split('T')[0];
+    a.download = `stock_backup_${today}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = () => {
+    try {
+      const parsed = JSON.parse(importText);
+      if (!parsed.stocks) {
+        alert('資料格式錯誤');
+        return;
+      }
+      if (confirm('匯入會覆蓋目前所有資料，確定？')) {
+        onImport(parsed);
+      }
+    } catch (e) {
+      alert('JSON 格式錯誤，無法解析');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl p-5 max-h-[92vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-lg font-bold text-gray-800">資料備份</h2>
+          <button onClick={onClose} className="text-gray-400 text-2xl leading-none">×</button>
+        </div>
+
+        <div className="bg-gray-100 rounded-xl p-1 flex mb-4">
+          <button
+            onClick={() => setMode('export')}
+            className={`flex-1 py-2 rounded-lg text-sm font-medium ${
+              mode === 'export' ? 'bg-white shadow-sm text-gray-800' : 'text-gray-500'
+            }`}
+          >
+            匯出
+          </button>
+          <button
+            onClick={() => setMode('import')}
+            className={`flex-1 py-2 rounded-lg text-sm font-medium ${
+              mode === 'import' ? 'bg-white shadow-sm text-gray-800' : 'text-gray-500'
+            }`}
+          >
+            匯入
+          </button>
+        </div>
+
+        {mode === 'export' ? (
+          <div className="space-y-3">
+            <div className="text-xs text-gray-500">
+              建議每次更新後備份，存到雲端硬碟或 LINE 給自己。
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={handleCopy}
+                className="py-3 rounded-xl text-sm font-medium text-white"
+                style={{ background: copied ? '#A8C4A2' : '#8E9AAF' }}
+              >
+                {copied ? '✓ 已複製' : '複製到剪貼簿'}
+              </button>
+              <button
+                onClick={handleDownload}
+                className="py-3 rounded-xl text-sm font-medium border border-gray-200 text-gray-700"
+              >
+                下載 JSON 檔
+              </button>
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">預覽</label>
+              <textarea
+                readOnly
+                value={exportJSON}
+                className="w-full h-48 px-3 py-2 border border-gray-200 rounded-xl text-xs font-mono bg-gray-50"
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="text-xs text-gray-500">
+              貼上備份的 JSON 內容，匯入會覆蓋目前所有資料。
+            </div>
+            <textarea
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              placeholder='{"stocks": {...}, "exchangeRate": 31.5}'
+              className="w-full h-48 px-3 py-2 border border-gray-200 rounded-xl text-xs font-mono"
+            />
+            <button
+              onClick={handleImport}
+              disabled={!importText.trim()}
+              className="w-full py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-40"
+              style={{ background: '#8E9AAF' }}
+            >
+              確認匯入
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
